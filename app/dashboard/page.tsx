@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useState, useMemo } from 'react';
+import Link from 'next/link';
 import { useAuth } from '@/contexts/auth-context';
 import {
   fetchLicenseOverview,
@@ -17,9 +18,11 @@ import {
   UserContext,
   DepartmentMetrics,
   ClassifiedUserForDrill,
+  ComplianceVerdict,
   classifyUser,
   aggregateByDepartment,
 } from '@/lib/user-classification';
+import { Capability, CAPABILITY_LABELS } from '@/lib/capability-coverage';
 import type { LicenseOverview, SubscriptionInfo, UserLicenseAssignment } from '@/types/license';
 import {
   Shield,
@@ -39,6 +42,11 @@ import {
   Download,
   ChevronRight,
   ListChecks,
+  ShieldCheck,
+  ShieldAlert,
+  HelpCircle,
+  Check,
+  BookOpen,
 } from 'lucide-react';
 
 interface ClassifiedUser {
@@ -55,6 +63,11 @@ type DrillCategory =
   | { kind: 'dormant' }
   | { kind: 'over-licensed' }
   | { kind: 'missing-data' }
+  | { kind: 'compliant' }
+  | { kind: 'gap' }
+  | { kind: 'exception' }
+  | { kind: 'disabled-licensed' }
+  | { kind: 'missing-capability'; capability: Capability }
   | { kind: 'department'; department: string }
   | null;
 
@@ -64,6 +77,7 @@ export default function DashboardPage() {
   const [users, setUsers] = useState<UserLicenseAssignment[]>([]);
   const [subscriptions, setSubscriptions] = useState<SubscriptionInfo[]>([]);
   const [signIns, setSignIns] = useState<SignInActivity[]>([]);
+  const [signInDataAvailable, setSignInDataAvailable] = useState(false);
   const [dataLoading, setDataLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [drill, setDrill] = useState<DrillCategory>(null);
@@ -78,12 +92,15 @@ export default function DashboardPage() {
           fetchLicenseOverview(accessToken),
           fetchUserAssignments(accessToken),
           fetchSubscriptions(accessToken),
-          fetchUserSignInActivity(accessToken).catch(() => [] as SignInActivity[]),
+          fetchUserSignInActivity(accessToken).catch(
+            () => ({ available: false, activities: [] as SignInActivity[] })
+          ),
         ]);
         setOverview(overviewData);
         setUsers(usersData);
         setSubscriptions(subsData);
-        setSignIns(signInData);
+        setSignIns(signInData.activities);
+        setSignInDataAvailable(signInData.available);
       } catch (err) {
         setError(err instanceof Error ? err.message : 'Failed to fetch data');
       } finally {
@@ -101,22 +118,26 @@ export default function DashboardPage() {
       return {
         user: { ...user, lastSignInDateTime: lastSignIn || user.lastSignInDateTime },
         lastSignInDateTime: lastSignIn,
-        classification: classifyUser({
-          userId: user.userId,
-          displayName: user.displayName,
-          userPrincipalName: user.userPrincipalName,
-          department: user.department,
-          jobTitle: user.jobTitle,
-          userTypeFromGraph: user.userTypeFromGraph,
-          usageLocation: user.usageLocation,
-          accountEnabled: user.accountEnabled,
-          assignedLicenseSkus: user.assignedLicenses,
-          licenseSkuNames: user.assignedLicenses,
-          lastSignInDateTime: lastSignIn,
-        }),
+        classification: classifyUser(
+          {
+            userId: user.userId,
+            displayName: user.displayName,
+            userPrincipalName: user.userPrincipalName,
+            department: user.department,
+            jobTitle: user.jobTitle,
+            userTypeFromGraph: user.userTypeFromGraph,
+            usageLocation: user.usageLocation,
+            accountEnabled: user.accountEnabled,
+            assignedLicenseSkus: user.assignedLicenses,
+            licenseSkuNames: user.assignedLicenses,
+            assignedPlans: user.assignedPlans,
+            lastSignInDateTime: lastSignIn,
+          },
+          { signInDataAvailable }
+        ),
       };
     });
-  }, [users, signIns]);
+  }, [users, signIns, signInDataAvailable]);
 
   // Department metrics
   const departmentMetrics = useMemo(
@@ -134,6 +155,7 @@ export default function DashboardPage() {
           accountEnabled: cu.user.accountEnabled,
           assignedLicenseSkus: cu.user.assignedLicenses,
           licenseSkuNames: cu.user.assignedLicenses,
+          assignedPlans: cu.user.assignedPlans,
           lastSignInDateTime: cu.lastSignInDateTime,
         },
       }))
@@ -153,6 +175,11 @@ export default function DashboardPage() {
       case 'dormant': return all.filter((u) => u.isDormant);
       case 'over-licensed': return all.filter((u) => u.actionFlags.includes('over-licensed'));
       case 'missing-data': return all.filter((u) => u.actionFlags.includes('missing-department') || u.actionFlags.includes('missing-title'));
+      case 'compliant': return all.filter((u) => u.complianceVerdict === 'compliant');
+      case 'gap': return all.filter((u) => u.complianceVerdict === 'gap');
+      case 'exception': return all.filter((u) => u.complianceVerdict === 'exception');
+      case 'disabled-licensed': return all.filter((u) => u.actionFlags.includes('disabled-but-licensed'));
+      case 'missing-capability': return all.filter((u) => u.complianceVerdict === 'gap' && u.coverage.missing.includes(drill.capability));
       case 'department': return all.filter((u) => u.department === drill.department);
     }
   }, [drill, departmentMetrics]);
@@ -164,29 +191,46 @@ export default function DashboardPage() {
     let totalWastedOnRedundancy = 0;
     const byType: Record<UserType, number> = { 'real-user': 0, 'mailbox-only': 0, 'service-account': 0, guest: 0, shared: 0, unknown: 0 };
     const byBundle: Record<BundleTier, number> = {
-      'e5': 0, 'e3': 0, 'e1': 0, 'f3': 0, 'f1': 0,
+      'e5': 0, 'e3': 0, 'o365-e5': 0, 'o365-e3': 0, 'e1': 0, 'f3': 0, 'f1': 0,
       'business-premium': 0, 'business-standard': 0, 'business-basic': 0,
       'ems-e5': 0, 'ems-e3': 0, 'unknown-bundle': 0,
     };
     let dormant = 0;
     let overLicensed = 0;
     let missingData = 0;
+    let compliant = 0;
+    let gap = 0;
+    let exception = 0;
+    let disabledLicensed = 0;
+    const missingByCapability: Record<Capability, number> = {
+      productivity: 0, teams: 0, intune: 0, entra: 0,
+    };
 
     for (const cu of classifiedUsers) {
-      byType[cu.classification.type]++;
-      byBundle[cu.classification.licenseAnalysis.effectiveBundle]++;
-      totalMonthlyCost += cu.classification.monthlyCostEstimate;
-      if (cu.classification.isDormant) {
+      const c = cu.classification;
+      byType[c.type]++;
+      byBundle[c.licenseAnalysis.effectiveBundle]++;
+      totalMonthlyCost += c.monthlyCostEstimate;
+      if (c.complianceVerdict === 'compliant') compliant++;
+      else if (c.complianceVerdict === 'gap') {
+        gap++;
+        for (const cap of c.coverage.missing) missingByCapability[cap]++;
+      } else exception++;
+      if (c.actionFlags.includes('disabled-but-licensed')) {
+        disabledLicensed++;
+        totalRiskSavings += c.monthlyCostEstimate;
+      }
+      if (c.isDormant) {
         dormant++;
-        totalRiskSavings += cu.classification.monthlyCostEstimate;
+        totalRiskSavings += c.monthlyCostEstimate;
       }
-      if (cu.classification.actionFlags.includes('over-licensed')) {
+      if (c.actionFlags.includes('over-licensed')) {
         overLicensed++;
-        totalWastedOnRedundancy += cu.classification.licenseAnalysis.redundantMonthlyCost;
-        totalRiskSavings += cu.classification.licenseAnalysis.redundantMonthlyCost;
+        totalWastedOnRedundancy += c.licenseAnalysis.redundantMonthlyCost;
+        totalRiskSavings += c.licenseAnalysis.redundantMonthlyCost;
       }
-      if (cu.classification.actionFlags.includes('missing-department') ||
-          cu.classification.actionFlags.includes('missing-title')) {
+      if (c.actionFlags.includes('missing-department') ||
+          c.actionFlags.includes('missing-title')) {
         missingData++;
       }
     }
@@ -200,6 +244,11 @@ export default function DashboardPage() {
       dormant,
       overLicensed,
       missingData,
+      compliant,
+      gap,
+      exception,
+      disabledLicensed,
+      missingByCapability,
     };
   }, [classifiedUsers]);
 
@@ -238,14 +287,22 @@ export default function DashboardPage() {
         <div className="flex items-center justify-between mb-8">
           <div>
             <h1 className="text-3xl font-bold">CTO Dashboard</h1>
-            <p className="text-gray-400 mt-1">License utilization, governance & action items</p>
+            <p className="text-gray-400 mt-1">License compliance, governance & action items</p>
           </div>
-          <a
-            href="/"
-            className="px-4 py-2 bg-gray-800 hover:bg-gray-700 rounded-lg text-sm transition-colors"
-          >
-            ← Back to Main
-          </a>
+          <div className="flex items-center gap-2">
+            <Link
+              href="/reference"
+              className="flex items-center gap-1.5 px-4 py-2 bg-gray-800 hover:bg-gray-700 rounded-lg text-sm transition-colors"
+            >
+              <BookOpen className="w-4 h-4" /> Licensing Matrix
+            </Link>
+            <Link
+              href="/"
+              className="px-4 py-2 bg-gray-800 hover:bg-gray-700 rounded-lg text-sm transition-colors"
+            >
+              ← Back to Main
+            </Link>
+          </div>
         </div>
 
         {error && (
@@ -254,11 +311,69 @@ export default function DashboardPage() {
           </div>
         )}
 
-        {/* Executive Summary Cards - all clickable */}
+        {!signInDataAvailable && (
+          <div className="mb-6 p-3 bg-gray-800/60 border border-gray-700 rounded-lg text-sm text-gray-300 flex items-center gap-2">
+            <HelpCircle className="w-4 h-4 text-gray-400" />
+            Sign-in activity is unavailable (needs <code className="text-gray-400">AuditLog.Read.All</code>).
+            Dormancy is shown as <strong>unknown</strong> rather than guessed.
+          </div>
+        )}
+
+        {/* Compliance headline — the primary decision */}
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+          <ClickableSummaryCard
+            icon={<ShieldCheck className="w-5 h-5" />}
+            label="Compliant Users"
+            value={summary.compliant}
+            color="green"
+            subtext="O365 + Teams + Entra/Intune covered · click to view"
+            onClick={() => setDrill({ kind: 'compliant' })}
+          />
+          <ClickableSummaryCard
+            icon={<ShieldAlert className="w-5 h-5" />}
+            label="Gaps to Fix"
+            value={summary.gap}
+            color="red"
+            subtext="Real users missing a required capability · IT action"
+            onClick={() => setDrill({ kind: 'gap' })}
+          />
+          <ClickableSummaryCard
+            icon={<HelpCircle className="w-5 h-5" />}
+            label="Exceptions to Review"
+            value={summary.exception}
+            color="yellow"
+            subtext="Mailboxes / guests / service accounts · accidental or intended?"
+            onClick={() => setDrill({ kind: 'exception' })}
+          />
+        </div>
+
+        {/* Capability gap breakdown — exactly what's missing across the org */}
+        {summary.gap > 0 && (
+          <div className="bg-gray-900 border border-gray-800 rounded-xl p-5 mb-6">
+            <h2 className="text-sm font-semibold text-gray-300 mb-3">
+              What&apos;s missing (click a capability to see who needs it)
+            </h2>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+              {(Object.keys(summary.missingByCapability) as Capability[]).map((cap) => (
+                <button
+                  key={cap}
+                  disabled={summary.missingByCapability[cap] === 0}
+                  onClick={() => setDrill({ kind: 'missing-capability', capability: cap })}
+                  className="text-left p-3 rounded-lg border border-gray-800 bg-gray-800/40 hover:bg-gray-800 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  <div className="text-2xl font-bold text-red-300">{summary.missingByCapability[cap]}</div>
+                  <div className="text-xs text-gray-400 mt-1">missing {CAPABILITY_LABELS[cap]}</div>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Secondary: cost & hygiene signals */}
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
           <SummaryCard
             icon={<TrendingUp className="w-5 h-5" />}
-            label="Monthly Cost"
+            label="Monthly Cost (est.)"
             value={`$${summary.totalMonthlyCost.toLocaleString()}`}
             color="purple"
             subtext={`${classifiedUsers.length} users`}
@@ -273,11 +388,11 @@ export default function DashboardPage() {
           />
           <ClickableSummaryCard
             icon={<UserX className="w-5 h-5" />}
-            label="Dormant Accounts"
-            value={summary.dormant}
+            label="Disabled but Licensed"
+            value={summary.disabledLicensed}
             color="orange"
-            subtext="No sign-in >30d · click to view"
-            onClick={() => setDrill({ kind: 'dormant' })}
+            subtext="Paying for disabled accounts · click to view"
+            onClick={() => setDrill({ kind: 'disabled-licensed' })}
           />
           <ClickableSummaryCard
             icon={<Building2 className="w-5 h-5" />}
@@ -386,6 +501,8 @@ export default function DashboardPage() {
                 <tr>
                   <th className="text-left px-4 py-3 font-medium text-gray-400">Department</th>
                   <th className="text-right px-4 py-3 font-medium text-gray-400">Users</th>
+                  <th className="text-right px-4 py-3 font-medium text-gray-400">Compliant</th>
+                  <th className="text-right px-4 py-3 font-medium text-gray-400">Gaps</th>
                   <th className="text-right px-4 py-3 font-medium text-gray-400">E5</th>
                   <th className="text-right px-4 py-3 font-medium text-gray-400">E3</th>
                   <th className="text-right px-4 py-3 font-medium text-gray-400">E1</th>
@@ -534,6 +651,10 @@ function DepartmentRow({ dept, onClick }: { dept: DepartmentMetrics; onClick: ()
         )}
       </td>
       <td className="px-4 py-3 text-right">{dept.headcount}</td>
+      <td className="px-4 py-3 text-right text-green-400">{dept.compliantCount || '-'}</td>
+      <td className="px-4 py-3 text-right">
+        {dept.gapCount > 0 ? <span className="text-red-400">{dept.gapCount}</span> : <span className="text-gray-600">-</span>}
+      </td>
       <td className="px-4 py-3 text-right text-blue-400">{dept.byBundle.e5 || '-'}</td>
       <td className="px-4 py-3 text-right text-blue-300">{dept.byBundle.e3 || '-'}</td>
       <td className="px-4 py-3 text-right text-gray-400">{dept.byBundle.e1 || '-'}</td>
@@ -564,16 +685,22 @@ function DrillModal({ category, users, onClose }: {
   const title = getDrillTitle(category);
   const exportCsv = () => {
     const rows = [
-      ['Display Name', 'UPN', 'Department', 'Job Title', 'Type', 'Bundle', 'Monthly Cost', 'Last Sign-In', 'Action Flags', 'Reason'],
+      ['Display Name', 'UPN', 'Department', 'Job Title', 'Type', 'Verdict', 'Account Enabled', 'Bundle', 'Productivity', 'Teams', 'Intune', 'Entra', 'Monthly Cost', 'Last Sign-In', 'Action Flags', 'Reason'],
       ...users.map((u) => [
         u.displayName,
         u.userPrincipalName,
         u.department,
         u.jobTitle || '',
         u.type,
+        u.complianceVerdict,
+        u.accountEnabled ? 'Yes' : 'No',
         u.bundleLabel,
+        u.coverage.productivityOk ? 'Yes' : 'No',
+        u.coverage.teamsOk ? 'Yes' : 'No',
+        u.coverage.intuneOk ? 'Yes' : 'No',
+        u.coverage.entraOk ? 'Yes' : 'No',
         u.monthlyCost.toString(),
-        u.lastSignInDateTime || 'Never',
+        u.lastSignInDateTime || (u.dormancyStatus === 'unknown' ? 'Unknown' : 'Never'),
         u.actionFlags.join(';'),
         u.reasonSummary,
       ]),
@@ -629,8 +756,10 @@ function DrillModal({ category, users, onClose }: {
                   <th className="text-left px-3 py-2 font-medium text-gray-400">Department</th>
                   <th className="text-left px-3 py-2 font-medium text-gray-400">Title</th>
                   <th className="text-left px-3 py-2 font-medium text-gray-400">Type</th>
+                  <th className="text-center px-3 py-2 font-medium text-gray-400" title="O365 Productivity · Teams · Intune · Entra">Coverage (P·T·I·E)</th>
                   <th className="text-left px-3 py-2 font-medium text-gray-400">Bundle</th>
                   <th className="text-left px-3 py-2 font-medium text-gray-400">Licenses</th>
+                  <th className="text-left px-3 py-2 font-medium text-gray-400">Status</th>
                   <th className="text-right px-3 py-2 font-medium text-gray-400">$/mo</th>
                   <th className="text-left px-3 py-2 font-medium text-gray-400">Last Sign-In</th>
                   <th className="text-left px-3 py-2 font-medium text-gray-400">Issues</th>
@@ -664,10 +793,24 @@ function DrillRow({ u }: { u: ClassifiedUserForDrill }) {
         <span className="text-xs px-2 py-0.5 bg-gray-800 rounded">{u.type}</span>
       </td>
       <td className="px-3 py-2">
+        <div className="flex items-center justify-center gap-1">
+          <CapDot ok={u.coverage.productivityOk} letter="P" label="O365 Productivity" />
+          <CapDot ok={u.coverage.teamsOk} letter="T" label="Teams Chat" />
+          <CapDot ok={u.coverage.intuneOk} letter="I" label="Intune" />
+          <CapDot ok={u.coverage.entraOk} letter="E" label="Entra ID Premium" />
+        </div>
+      </td>
+      <td className="px-3 py-2">
         <span className="text-xs px-2 py-0.5 bg-blue-900/50 text-blue-300 rounded">{u.bundleLabel}</span>
       </td>
       <td className="px-3 py-2 text-xs text-gray-400 max-w-xs truncate" title={u.skuIds.join('\n')}>
         {u.skuIds.map((id) => getSkuFriendlyName(id)).join(' + ') || <span className="text-red-400">None</span>}
+      </td>
+      <td className="px-3 py-2">
+        <VerdictBadge verdict={u.complianceVerdict} />
+        {!u.accountEnabled && (
+          <span className="ml-1 text-xs px-1.5 py-0.5 rounded bg-orange-900/50 text-orange-300">disabled</span>
+        )}
       </td>
       <td className="px-3 py-2 text-right">${u.monthlyCost}</td>
       <td className="px-3 py-2 text-xs text-gray-500">
@@ -693,6 +836,33 @@ function DrillRow({ u }: { u: ClassifiedUserForDrill }) {
   );
 }
 
+function CapDot({ ok, letter, label }: { ok: boolean; letter: string; label: string }) {
+  return (
+    <span
+      title={`${label}: ${ok ? 'covered' : 'missing'}`}
+      className={`inline-flex items-center justify-center w-5 h-5 rounded text-[10px] font-bold ${
+        ok ? 'bg-green-900/60 text-green-300' : 'bg-gray-800 text-gray-600 line-through'
+      }`}
+    >
+      {letter}
+    </span>
+  );
+}
+
+function VerdictBadge({ verdict }: { verdict: ComplianceVerdict }) {
+  const map: Record<ComplianceVerdict, { label: string; cls: string; icon: React.ReactNode }> = {
+    compliant: { label: 'Compliant', cls: 'bg-green-900/50 text-green-300', icon: <Check className="w-3 h-3" /> },
+    gap: { label: 'Gap', cls: 'bg-red-900/50 text-red-300', icon: <ShieldAlert className="w-3 h-3" /> },
+    exception: { label: 'Exception', cls: 'bg-yellow-900/50 text-yellow-300', icon: <HelpCircle className="w-3 h-3" /> },
+  };
+  const v = map[verdict];
+  return (
+    <span className={`inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded ${v.cls}`}>
+      {v.icon} {v.label}
+    </span>
+  );
+}
+
 function getDrillTitle(category: NonNullable<DrillCategory>): string {
   switch (category.kind) {
     case 'service-account': return 'Service Accounts';
@@ -702,6 +872,11 @@ function getDrillTitle(category: NonNullable<DrillCategory>): string {
     case 'dormant': return 'Dormant Accounts (No sign-in >30 days)';
     case 'over-licensed': return 'Over-Licensed Users (Redundant SKUs)';
     case 'missing-data': return 'Users Missing Department / Title';
+    case 'compliant': return 'Compliant Users (O365 + Teams + Entra/Intune)';
+    case 'gap': return 'Gaps to Fix — Real Users Missing a Required Capability';
+    case 'exception': return 'Exceptions to Review (mailbox / guest / service / shared)';
+    case 'disabled-licensed': return 'Disabled Accounts Still Holding Licenses';
+    case 'missing-capability': return `Users Missing: ${CAPABILITY_LABELS[category.capability]}`;
     case 'department': return `Department: ${category.department}`;
   }
 }

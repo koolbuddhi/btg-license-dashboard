@@ -1,8 +1,30 @@
 import { LicenseTier } from './license-tiers';
-import { analyzeUserLicenses, LicenseAnalysis, BUNDLE_INFO, BundleTier } from './license-sku-map';
+import { analyzeUserLicenses, LicenseAnalysis, BundleTier } from './license-sku-map';
+import {
+  evaluateCoverage,
+  CoverageResult,
+  CapabilityRequirement,
+  DEFAULT_REQUIREMENT,
+  AssignedPlan,
+  CAPABILITY_LABELS,
+} from './capability-coverage';
 
 export type UserType = 'real-user' | 'mailbox-only' | 'service-account' | 'guest' | 'shared' | 'unknown';
-export type ActionFlag = 'dormant' | 'over-licensed' | 'under-licensed' | 'missing-department' | 'missing-title' | 'no-license' | 'redundant-sku';
+export type ActionFlag =
+  | 'dormant'
+  | 'over-licensed'
+  | 'under-licensed'
+  | 'missing-department'
+  | 'missing-title'
+  | 'no-license'
+  | 'redundant-sku'
+  | 'missing-capability'
+  | 'disabled-but-licensed';
+
+/** Whether a real user has the capabilities the org policy requires. */
+export type ComplianceVerdict = 'compliant' | 'gap' | 'exception';
+/** Sign-in based activity status. 'unknown' = sign-in data unavailable (don't penalize). */
+export type DormancyStatus = 'active' | 'dormant' | 'unknown';
 
 export interface UserContext {
   userId: string;
@@ -13,9 +35,17 @@ export interface UserContext {
   userTypeFromGraph?: string;
   assignedLicenseSkus: string[];
   licenseSkuNames: string[];
+  assignedPlans: AssignedPlan[];
   lastSignInDateTime?: string;
   usageLocation?: string;
   accountEnabled?: boolean;
+}
+
+export interface ClassifyOptions {
+  /** False when the tenant did not return signInActivity — dormancy becomes 'unknown'. */
+  signInDataAvailable?: boolean;
+  /** Required capability profile (segment-aware; defaults to the org-wide baseline). */
+  requirement?: CapabilityRequirement;
 }
 
 export interface UserClassification {
@@ -25,6 +55,9 @@ export interface UserClassification {
   actionFlags: ActionFlag[];
   reasonSummary: string;
   isDormant: boolean;
+  dormancyStatus: DormancyStatus;
+  complianceVerdict: ComplianceVerdict;
+  coverage: CoverageResult;
   monthlyCostEstimate: number;
   licenseAnalysis: LicenseAnalysis;
 }
@@ -60,7 +93,8 @@ function detectShared(upn: string, dept?: string, title?: string): boolean {
   );
 }
 
-export function classifyUser(user: UserContext): UserClassification {
+export function classifyUser(user: UserContext, opts: ClassifyOptions = {}): UserClassification {
+  const { signInDataAvailable = false, requirement = DEFAULT_REQUIREMENT } = opts;
   const actionFlags: ActionFlag[] = [];
   const reasonParts: string[] = [];
 
@@ -90,8 +124,7 @@ export function classifyUser(user: UserContext): UserClassification {
       reasonParts.push('Only component SKUs (no main bundle)');
     } else if (user.assignedLicenseSkus.length === 0) {
       type = 'real-user';
-      actionFlags.push('no-license');
-      reasonParts.push('No license assigned');
+      // 'no-license' flag + reason are added in the compliance-verdict step below.
     } else {
       type = 'real-user';
     }
@@ -101,6 +134,8 @@ export function classifyUser(user: UserContext): UserClassification {
   const bundleToTier: Record<BundleTier, LicenseTier> = {
     'e5': 'premium',
     'e3': 'premium',
+    'o365-e5': 'premium',
+    'o365-e3': 'premium',
     'e1': 'basic',
     'f3': 'basic',
     'f1': 'mailbox',
@@ -113,7 +148,38 @@ export function classifyUser(user: UserContext): UserClassification {
   };
   const primaryTier = bundleToTier[licenseAnalysis.effectiveBundle];
 
-  // 5. Detect over-licensing (bundle + redundant SKUs already in the bundle)
+  // 5. Capability coverage — detected from actual enabled service plans (suite OR à-la-carte)
+  const coverage = evaluateCoverage(user.assignedPlans, requirement);
+
+  // 6. Compliance verdict. Real users are held to the capability policy; non-user
+  //    accounts (mailbox/service/shared/guest) are expected exceptions to review.
+  let complianceVerdict: ComplianceVerdict;
+  if (type === 'real-user') {
+    if (user.assignedLicenseSkus.length === 0) {
+      complianceVerdict = 'gap';
+      actionFlags.push('no-license');
+      reasonParts.push('No license assigned');
+    } else if (coverage.satisfied) {
+      complianceVerdict = 'compliant';
+    } else {
+      complianceVerdict = 'gap';
+      actionFlags.push('missing-capability');
+      reasonParts.push(
+        `Missing: ${coverage.missing.map((c) => CAPABILITY_LABELS[c]).join(', ')}`
+      );
+    }
+  } else {
+    complianceVerdict = 'exception';
+  }
+
+  // 7. Disabled-but-licensed — paying for a disabled account is almost always an
+  //    offboarding miss (accidental). Flag it regardless of account type.
+  if (user.accountEnabled === false && user.assignedLicenseSkus.length > 0) {
+    actionFlags.push('disabled-but-licensed');
+    reasonParts.push('Account disabled but still holds paid licenses');
+  }
+
+  // 8. Detect over-licensing (bundle + redundant SKUs already in the bundle) — secondary/cost signal
   if (type === 'real-user' && hasRedundant) {
     actionFlags.push('redundant-sku');
     actionFlags.push('over-licensed');
@@ -122,7 +188,7 @@ export function classifyUser(user: UserContext): UserClassification {
     );
   }
 
-  // 6. Missing data flags
+  // 9. Missing data flags
   if (!user.department || user.department.trim() === '') {
     actionFlags.push('missing-department');
     reasonParts.push('Missing department');
@@ -135,11 +201,12 @@ export function classifyUser(user: UserContext): UserClassification {
     reasonParts.push('No usage location set');
   }
 
-  // 7. Dormancy check
-  const isDormant = checkDormant(user.lastSignInDateTime, user.assignedLicenseSkus.length, type);
+  // 10. Dormancy — distinguish confirmed-dormant from unknown (no sign-in data / permission)
+  const dormancyStatus = checkDormancy(user.lastSignInDateTime, type, signInDataAvailable);
+  const isDormant = dormancyStatus === 'dormant';
   if (isDormant) {
     actionFlags.push('dormant');
-    reasonParts.push('Dormant: no sign-in >30d or unused');
+    reasonParts.push('Dormant: no sign-in >30d');
   }
 
   return {
@@ -149,19 +216,28 @@ export function classifyUser(user: UserContext): UserClassification {
     actionFlags,
     reasonSummary: reasonParts.join(' • '),
     isDormant,
+    dormancyStatus,
+    complianceVerdict,
+    coverage,
     monthlyCostEstimate: licenseAnalysis.totalMonthlyCost,
     licenseAnalysis,
   };
 }
 
-function checkDormant(lastSignInDateTime: string | undefined, licenseCount: number, type: UserType): boolean {
-  if (type === 'guest' || type === 'service-account' || type === 'shared') return false;
-  if (licenseCount === 0) return true;
-  if (!lastSignInDateTime) return true;
+function checkDormancy(
+  lastSignInDateTime: string | undefined,
+  type: UserType,
+  signInDataAvailable: boolean
+): DormancyStatus {
+  // Non-user accounts are not evaluated for dormancy (sign-in is expected to be absent).
+  if (type === 'guest' || type === 'service-account' || type === 'shared') return 'active';
+  // Without sign-in data we cannot tell — never auto-flag as dormant.
+  if (!signInDataAvailable) return 'unknown';
+  if (!lastSignInDateTime) return 'dormant';
   const lastSignIn = new Date(lastSignInDateTime);
   const now = new Date();
   const daysSince = (now.getTime() - lastSignIn.getTime()) / (1000 * 60 * 60 * 24);
-  return daysSince > DORMANT_DAYS;
+  return daysSince > DORMANT_DAYS ? 'dormant' : 'active';
 }
 
 export interface DepartmentMetrics {
@@ -169,12 +245,17 @@ export interface DepartmentMetrics {
   headcount: number;
   byType: Record<UserType, number>;
   byBundle: Record<BundleTier, number>;
+  compliantCount: number;
+  gapCount: number;
+  exceptionCount: number;
   redundantSkuCount: number;
   redundantMonthlyCost: number;
   dormantCount: number;
   missingDataCount: number;
   totalMonthlyCost: number;
   utilizationRate: number;
+  /** Share of real users that are compliant (0..1). */
+  complianceRate: number;
   costOptimalScore: number;
   users: ClassifiedUserForDrill[]; // for drill-down
 }
@@ -191,6 +272,10 @@ export interface ClassifiedUserForDrill {
   actionFlags: ActionFlag[];
   reasonSummary: string;
   isDormant: boolean;
+  dormancyStatus: DormancyStatus;
+  complianceVerdict: ComplianceVerdict;
+  coverage: CoverageResult;
+  accountEnabled: boolean;
   monthlyCost: number;
   lastSignInDateTime?: string;
   skuIds: string[];
@@ -213,7 +298,7 @@ export function aggregateByDepartment(
       'real-user': 0, 'mailbox-only': 0, 'service-account': 0, guest: 0, shared: 0, unknown: 0,
     };
     const byBundle: Record<BundleTier, number> = {
-      'e5': 0, 'e3': 0, 'e1': 0, 'f3': 0, 'f1': 0,
+      'e5': 0, 'e3': 0, 'o365-e5': 0, 'o365-e3': 0, 'e1': 0, 'f3': 0, 'f1': 0,
       'business-premium': 0, 'business-standard': 0, 'business-basic': 0,
       'ems-e5': 0, 'ems-e3': 0, 'unknown-bundle': 0,
     };
@@ -223,6 +308,9 @@ export function aggregateByDepartment(
     let redundantMonthlyCost = 0;
     let dormantCount = 0;
     let missingDataCount = 0;
+    let compliantCount = 0;
+    let gapCount = 0;
+    let exceptionCount = 0;
     const drillUsers: ClassifiedUserForDrill[] = [];
 
     for (const { classification, user } of entries) {
@@ -231,6 +319,9 @@ export function aggregateByDepartment(
       totalCost += classification.monthlyCostEstimate;
       redundantSkuCount += classification.licenseAnalysis.redundantSkus.length;
       redundantMonthlyCost += classification.licenseAnalysis.redundantMonthlyCost;
+      if (classification.complianceVerdict === 'compliant') compliantCount++;
+      else if (classification.complianceVerdict === 'gap') gapCount++;
+      else exceptionCount++;
       if (classification.actionFlags.includes('dormant')) dormantCount++;
       if (classification.actionFlags.includes('missing-department') ||
           classification.actionFlags.includes('missing-title')) {
@@ -250,6 +341,10 @@ export function aggregateByDepartment(
         actionFlags: classification.actionFlags,
         reasonSummary: classification.reasonSummary,
         isDormant: classification.isDormant,
+        dormancyStatus: classification.dormancyStatus,
+        complianceVerdict: classification.complianceVerdict,
+        coverage: classification.coverage,
+        accountEnabled: user.accountEnabled !== false,
         monthlyCost: classification.monthlyCostEstimate,
         lastSignInDateTime: user.lastSignInDateTime,
         skuIds: user.assignedLicenseSkus,
@@ -257,6 +352,8 @@ export function aggregateByDepartment(
     }
 
     const utilizationRate = entries.length > 0 ? activeUsers / entries.length : 0;
+    const realUserTotal = compliantCount + gapCount;
+    const complianceRate = realUserTotal > 0 ? compliantCount / realUserTotal : 1;
     const issues = (redundantSkuCount > 0 ? 1 : 0) + missingDataCount + dormantCount;
     const costOptimalScore = Math.max(0, 100 - issues * 5 - (1 - utilizationRate) * 30 - (redundantMonthlyCost / Math.max(totalCost, 1)) * 20);
 
@@ -265,12 +362,16 @@ export function aggregateByDepartment(
       headcount: entries.length,
       byType,
       byBundle,
+      compliantCount,
+      gapCount,
+      exceptionCount,
       redundantSkuCount,
       redundantMonthlyCost,
       dormantCount,
       missingDataCount,
       totalMonthlyCost: Math.round(totalCost),
       utilizationRate,
+      complianceRate,
       costOptimalScore: Math.round(costOptimalScore),
       users: drillUsers,
     });

@@ -89,30 +89,63 @@ export async function fetchLicenseSkus(token: string): Promise<LicenseSku[]> {
   }));
 }
 
-export async function fetchUserAssignments(
-  token: string,
-  top: number = 999
-): Promise<UserLicenseAssignment[]> {
-  const response = await fetch(
-    `https://graph.microsoft.com/v1.0/users?$top=${top}&$select=id,displayName,userPrincipalName,department,jobTitle,usageLocation,userType,accountEnabled,assignedLicenses`,
-    {
-      headers: { Authorization: `Bearer ${token}` },
-    }
-  );
-  if (!response.ok) throw new Error('Failed to fetch user assignments');
-  const data = await response.json();
-  return data.value.map((user: any) => ({
-    userId: user.id,
-    displayName: user.displayName,
-    userPrincipalName: user.userPrincipalName,
+interface GraphUser {
+  id?: string;
+  displayName?: string;
+  userPrincipalName?: string;
+  department?: string | null;
+  jobTitle?: string | null;
+  usageLocation?: string | null;
+  userType?: string | null;
+  accountEnabled?: boolean;
+  assignedLicenses?: { skuId: string }[];
+  assignedPlans?: { servicePlanId: string; capabilityStatus: string }[];
+  signInActivity?: { lastSignInDateTime?: string };
+}
+
+interface GraphPage {
+  value?: GraphUser[];
+  '@odata.nextLink'?: string;
+}
+
+function mapUserAssignment(user: GraphUser): UserLicenseAssignment {
+  return {
+    userId: user.id || '',
+    displayName: user.displayName || '',
+    userPrincipalName: user.userPrincipalName || '',
     department: user.department || undefined,
     jobTitle: user.jobTitle || undefined,
     usageLocation: user.usageLocation || undefined,
     userTypeFromGraph: user.userType || undefined,
     accountEnabled: user.accountEnabled !== false,
-    assignedLicenses: (user.assignedLicenses || []).map((l: any) => l.skuId),
+    assignedLicenses: (user.assignedLicenses || []).map((l) => l.skuId),
+    assignedPlans: (user.assignedPlans || []).map((p) => ({
+      servicePlanId: p.servicePlanId,
+      capabilityStatus: p.capabilityStatus,
+    })),
     licenseDetails: [],
-  }));
+  };
+}
+
+export async function fetchUserAssignments(
+  token: string,
+  top: number = 999
+): Promise<UserLicenseAssignment[]> {
+  const select =
+    'id,displayName,userPrincipalName,department,jobTitle,usageLocation,userType,accountEnabled,assignedLicenses,assignedPlans';
+  let url: string | undefined =
+    `https://graph.microsoft.com/v1.0/users?$top=${top}&$select=${select}`;
+  const all: UserLicenseAssignment[] = [];
+
+  // Follow @odata.nextLink so tenants with >999 users are not silently truncated.
+  while (url) {
+    const response = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    if (!response.ok) throw new Error('Failed to fetch user assignments');
+    const data: GraphPage = await response.json();
+    for (const user of data.value || []) all.push(mapUserAssignment(user));
+    url = data['@odata.nextLink'];
+  }
+  return all;
 }
 
 export interface SignInActivity {
@@ -121,26 +154,37 @@ export interface SignInActivity {
   lastSignInDateTime?: string;
 }
 
+export interface SignInActivityResult {
+  /** False when the tenant/permission did not return signInActivity at all. */
+  available: boolean;
+  activities: SignInActivity[];
+}
+
 export async function fetchUserSignInActivity(
   token: string,
   top: number = 999
-): Promise<SignInActivity[]> {
-  const response = await fetch(
-    `https://graph.microsoft.com/beta/users?$top=${top}&$select=id,userPrincipalName,signInActivity`,
-    {
-      headers: { Authorization: `Bearer ${token}` },
+): Promise<SignInActivityResult> {
+  let url: string | undefined =
+    `https://graph.microsoft.com/beta/users?$top=${top}&$select=id,userPrincipalName,signInActivity`;
+  const activities: SignInActivity[] = [];
+
+  while (url) {
+    const response = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    if (!response.ok) {
+      console.warn('signInActivity not available (requires beta or audit log access)');
+      return { available: false, activities: [] };
     }
-  );
-  if (!response.ok) {
-    console.warn('signInActivity not available (requires beta or audit log access)');
-    return [];
+    const data: GraphPage = await response.json();
+    for (const user of data.value || []) {
+      activities.push({
+        userId: user.id || '',
+        userPrincipalName: user.userPrincipalName || '',
+        lastSignInDateTime: user.signInActivity?.lastSignInDateTime,
+      });
+    }
+    url = data['@odata.nextLink'];
   }
-  const data = await response.json();
-  return data.value.map((user: any) => ({
-    userId: user.id,
-    userPrincipalName: user.userPrincipalName,
-    lastSignInDateTime: user.signInActivity?.lastSignInDateTime,
-  }));
+  return { available: true, activities };
 }
 
 export async function fetchLicenseOverview(

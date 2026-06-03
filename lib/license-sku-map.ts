@@ -27,8 +27,9 @@ export const SKU_GUIDS = {
   EMS_E3: 'efccb6f7-5641-4e0e-bd10-b4976e1bf68e',            // EMS E3
 
   // Microsoft 365 Business (SMB)
-  M365_BUSINESS_PREMIUM: 'cbdc14ab-d96c-4c30-b9f4-6ada7cdc1d46',   // M365 Business Premium
-  M365_BUSINESS_STANDARD: 'ac5cef5d-921b-4f97-9ef3-c99076e5470f', // M365 Business Standard
+  M365_BUSINESS_PREMIUM: 'cbdc14ab-d96c-4c30-b9f4-6ada7cdc1d46',   // M365 Business Premium (SPB)
+  M365_BUSINESS_STANDARD: 'f245ecc8-75af-4f8e-b61f-27d8114de5f3',  // M365 Business Standard (O365_BUSINESS_PREMIUM)
+  M365_BUSINESS_STANDARD_LEGACY: 'ac5cef5d-921b-4f97-9ef3-c99076e5470f', // Business Standard - Prepaid Legacy
   M365_BUSINESS_BASIC: 'dab7782a-93b1-4074-8bb1-0e61318bea0b',    // M365 Business Basic
 
   // Security & Identity add-ons
@@ -36,8 +37,6 @@ export const SKU_GUIDS = {
   AAD_PREMIUM_P1: '078d2b04-f1bd-4111-bbd4-b4b1b354cef4',     // Entra ID P1
   AAD_BASIC: '2b9c8e7c-319c-43a2-a2a0-48c5c6161de7',
   IDENTITY_THREAT_PROTECTION: '26124093-3d78-432b-b5dc-48bf992543d5',  // M365 E5 Security
-  DEFENDER_ENDPOINT_P1: '8e7c2c1e-1f5c-4f5f-9f5f-5f5f5f5f5f5f', // placeholder
-  DEFENDER_FOR_OFFICE_P2: '4ff02e5f-f6ab-4f1c-8c1e-2b8e7e1c3a4d', // placeholder
   INTUNE_A: '061f9ace-7d42-4136-88ac-31dc755f143f',
 
   // Exchange
@@ -46,6 +45,7 @@ export const SKU_GUIDS = {
   EXCHANGE_KIOSK: '80b2d799-d2ba-4d2a-8842-fb0d0f3a4b82',      // Exchange Online Kiosk
 
   // Teams & Communication
+  TEAMS_ESSENTIALS: 'fde42873-30b6-436b-b361-21af5a6b84ae',     // Microsoft Teams Essentials (standalone)
   TEAMS_PHONE_SYSTEM: 'e43b5b99-8dfb-405f-9987-dc307f34bcbd',  // M365 Phone System
   TEAMS_PHONE_CALLING: '1f2f344a-700d-42c9-9fb2-1e0f0e569590',  // Teams Phone with Calling Plan
   TEAMS_AUDIO_CONF: '0c266dff-15dd-4b49-8397-2bb16070ed52',     // Audio Conferencing
@@ -97,7 +97,9 @@ export const SKU_FRIENDLY: Record<string, string> = {
   [SKU_GUIDS.EMS_E3]: 'EMS E3',
   [SKU_GUIDS.M365_BUSINESS_PREMIUM]: 'M365 Business Premium',
   [SKU_GUIDS.M365_BUSINESS_STANDARD]: 'M365 Business Standard',
+  [SKU_GUIDS.M365_BUSINESS_STANDARD_LEGACY]: 'M365 Business Standard (Legacy)',
   [SKU_GUIDS.M365_BUSINESS_BASIC]: 'M365 Business Basic',
+  [SKU_GUIDS.TEAMS_ESSENTIALS]: 'Teams Essentials',
   [SKU_GUIDS.AAD_PREMIUM_P2]: 'Entra ID P2',
   [SKU_GUIDS.AAD_PREMIUM_P1]: 'Entra ID P1',
   [SKU_GUIDS.AAD_BASIC]: 'Entra ID Basic',
@@ -142,9 +144,11 @@ export function getSkuFriendlyName(skuId: string): string {
  * The "effective" license is the highest bundle the user has.
  */
 export type BundleTier =
-  | 'e5'        // M365 E5 / O365 E5 (full premium)
-  | 'e3'        // M365 E3 / O365 E3 (standard enterprise)
-  | 'e1'        // O365 E1 (basic enterprise)
+  | 'e5'        // Microsoft 365 E5 (full premium — includes EMS: Intune + Entra P2)
+  | 'e3'        // Microsoft 365 E3 (standard enterprise — includes Intune + Entra P1)
+  | 'o365-e5'   // Office 365 E5 (productivity + Teams; NO Intune/Entra)
+  | 'o365-e3'   // Office 365 E3 (productivity + Teams; NO Intune/Entra)
+  | 'e1'        // Office 365 E1 (basic enterprise; NO Intune/Entra)
   | 'f3'        // Frontline F3 (desk worker)
   | 'f1'        // Frontline F1 (limited)
   | 'business-premium'
@@ -156,30 +160,44 @@ export type BundleTier =
 
 const BUNDLE_RANK: Record<BundleTier, number> = {
   'e5': 100,
+  'o365-e5': 90,
   'e3': 80,
-  'e1': 50,
+  'o365-e3': 68,
   'f3': 70,
-  'f1': 40,
   'business-premium': 75,
   'business-standard': 55,
-  'business-basic': 30,
+  'e1': 50,
   'ems-e5': 60,
   'ems-e3': 45,
+  'f1': 40,
+  'business-basic': 30,
   'unknown-bundle': 0,
 };
 
 export const BUNDLE_INFO: Record<BundleTier, { label: string; description: string; monthlyCost: number; includes: string[] }> = {
   'e5': {
-    label: 'E5 Bundle',
-    description: 'Microsoft 365 E5 — full premium (includes E3, Entra P2, Defender P2, Phone System, Audio, Compliance)',
+    label: 'Microsoft 365 E5',
+    description: 'Microsoft 365 E5 — full premium (includes E3, Intune, Entra P2, Defender P2, Phone System, Audio, Compliance)',
     monthlyCost: 57,
-    includes: ['E3', 'Entra ID P2', 'Defender for Endpoint P2', 'Defender for Office P2', 'Teams Phone System', 'Audio Conferencing', 'E5 Compliance', 'Power BI Pro'],
+    includes: ['E3', 'Intune', 'Entra ID P2', 'Defender for Endpoint P2', 'Defender for Office P2', 'Teams Phone System', 'Audio Conferencing', 'E5 Compliance', 'Power BI Pro'],
   },
   'e3': {
-    label: 'E3 Bundle',
-    description: 'Microsoft 365 E3 — standard enterprise (includes E1, Exchange P2, Teams, Intune, AIP P1)',
+    label: 'Microsoft 365 E3',
+    description: 'Microsoft 365 E3 — standard enterprise (includes E1, Exchange P2, Teams, Intune, Entra P1, AIP P1)',
     monthlyCost: 36,
-    includes: ['Office Apps', 'Exchange P2', 'Teams', 'SharePoint', 'OneDrive', 'Intune', 'AIP P1', 'Defender for Endpoint P1'],
+    includes: ['Office Apps', 'Exchange P2', 'Teams', 'SharePoint', 'OneDrive', 'Intune', 'Entra ID P1', 'AIP P1', 'Defender for Endpoint P1'],
+  },
+  'o365-e5': {
+    label: 'Office 365 E5',
+    description: 'Office 365 E5 — productivity + Teams + Phone/Audio. NO Intune or Entra ID (no EMS).',
+    monthlyCost: 38,
+    includes: ['Office Apps', 'Exchange P2', 'Teams', 'SharePoint', 'OneDrive', 'Teams Phone System', 'Audio Conferencing', 'Power BI Pro'],
+  },
+  'o365-e3': {
+    label: 'Office 365 E3',
+    description: 'Office 365 E3 — productivity + Teams. NO Intune or Entra ID (no EMS).',
+    monthlyCost: 20,
+    includes: ['Office Apps', 'Exchange P2', 'Teams', 'SharePoint', 'OneDrive'],
   },
   'e1': {
     label: 'E1 Bundle',
@@ -240,11 +258,13 @@ export const BUNDLE_INFO: Record<BundleTier, { label: string; description: strin
 export function getBundleTier(skuId: string): BundleTier {
   switch (skuId) {
     case SKU_GUIDS.M365_E5:
-    case SKU_GUIDS.O365_E5:
       return 'e5';
+    case SKU_GUIDS.O365_E5:
+      return 'o365-e5';
     case SKU_GUIDS.M365_E3:
-    case SKU_GUIDS.O365_E3:
       return 'e3';
+    case SKU_GUIDS.O365_E3:
+      return 'o365-e3';
     case SKU_GUIDS.O365_E1:
       return 'e1';
     case SKU_GUIDS.M365_F3:
@@ -255,6 +275,7 @@ export function getBundleTier(skuId: string): BundleTier {
     case SKU_GUIDS.M365_BUSINESS_PREMIUM:
       return 'business-premium';
     case SKU_GUIDS.M365_BUSINESS_STANDARD:
+    case SKU_GUIDS.M365_BUSINESS_STANDARD_LEGACY:
       return 'business-standard';
     case SKU_GUIDS.M365_BUSINESS_BASIC:
       return 'business-basic';
@@ -290,19 +311,28 @@ export interface LicenseAnalysis {
  */
 const BUNDLE_INCLUDES: Record<BundleTier, string[]> = {
   'e5': [
-    SKU_GUIDS.M365_E3, SKU_GUIDS.O365_E3, SKU_GUIDS.O365_E1,
+    SKU_GUIDS.M365_E3, SKU_GUIDS.O365_E5, SKU_GUIDS.O365_E3, SKU_GUIDS.O365_E1,
     SKU_GUIDS.EMS_E5, SKU_GUIDS.EMS_E3,
     SKU_GUIDS.AAD_PREMIUM_P2, SKU_GUIDS.AAD_PREMIUM_P1, SKU_GUIDS.AAD_BASIC,
     SKU_GUIDS.IDENTITY_THREAT_PROTECTION, SKU_GUIDS.INTUNE_A,
     SKU_GUIDS.EXCHANGE_P1, SKU_GUIDS.EXCHANGE_P2,
-    SKU_GUIDS.TEAMS_PHONE_SYSTEM, SKU_GUIDS.TEAMS_AUDIO_CONF,
+    SKU_GUIDS.TEAMS_PHONE_SYSTEM, SKU_GUIDS.TEAMS_AUDIO_CONF, SKU_GUIDS.TEAMS_ESSENTIALS,
     SKU_GUIDS.POWER_BI_PRO, SKU_GUIDS.AIP_PLAN1, SKU_GUIDS.E5_COMPLIANCE,
   ],
   'e3': [
-    SKU_GUIDS.O365_E1, SKU_GUIDS.EMS_E3, SKU_GUIDS.EMS_E5,
+    SKU_GUIDS.O365_E3, SKU_GUIDS.O365_E1, SKU_GUIDS.EMS_E3, SKU_GUIDS.EMS_E5,
     SKU_GUIDS.AAD_PREMIUM_P1, SKU_GUIDS.AAD_BASIC,
     SKU_GUIDS.INTUNE_A, SKU_GUIDS.EXCHANGE_P1, SKU_GUIDS.EXCHANGE_P2,
-    SKU_GUIDS.AIP_PLAN1,
+    SKU_GUIDS.TEAMS_ESSENTIALS, SKU_GUIDS.AIP_PLAN1,
+  ],
+  // Office 365 E5/E3 — productivity + Teams ONLY. Deliberately NO Intune/Entra (no EMS component).
+  'o365-e5': [
+    SKU_GUIDS.O365_E3, SKU_GUIDS.O365_E1, SKU_GUIDS.EXCHANGE_P1, SKU_GUIDS.EXCHANGE_P2,
+    SKU_GUIDS.TEAMS_PHONE_SYSTEM, SKU_GUIDS.TEAMS_AUDIO_CONF, SKU_GUIDS.TEAMS_ESSENTIALS,
+    SKU_GUIDS.POWER_BI_PRO,
+  ],
+  'o365-e3': [
+    SKU_GUIDS.O365_E1, SKU_GUIDS.EXCHANGE_P1, SKU_GUIDS.EXCHANGE_P2, SKU_GUIDS.TEAMS_ESSENTIALS,
   ],
   'e1': [
     SKU_GUIDS.EXCHANGE_P1, SKU_GUIDS.AAD_BASIC,
@@ -367,7 +397,9 @@ const SKU_COST: Record<string, number> = {
   [SKU_GUIDS.EMS_E3]: 10.05,
   [SKU_GUIDS.M365_BUSINESS_PREMIUM]: 22,
   [SKU_GUIDS.M365_BUSINESS_STANDARD]: 12.5,
+  [SKU_GUIDS.M365_BUSINESS_STANDARD_LEGACY]: 12.5,
   [SKU_GUIDS.M365_BUSINESS_BASIC]: 6,
+  [SKU_GUIDS.TEAMS_ESSENTIALS]: 4,
   [SKU_GUIDS.AAD_PREMIUM_P2]: 9,
   [SKU_GUIDS.AAD_PREMIUM_P1]: 6,
   [SKU_GUIDS.AAD_BASIC]: 1,
