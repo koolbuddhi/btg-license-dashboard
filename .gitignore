@@ -42,3 +42,7 @@ next-env.d.ts
 
 # kilo
 .kilo/
+
+# Lockfile excluded: npm-generated lockfiles on macOS omit Linux WASM optional
+# deps (@emnapi/*), which breaks "npm ci" on Cloudflare. Let CI run "npm install".
+package-lock.json
