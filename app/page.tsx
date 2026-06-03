@@ -236,6 +236,12 @@ export default function Home() {
             <h1 className="text-xl font-bold">Microsoft License Checker</h1>
           </div>
           <div className="flex items-center gap-4">
+            <a
+              href="/dashboard"
+              className="px-3 py-1.5 bg-blue-600/20 text-blue-300 hover:bg-blue-600/30 rounded text-sm font-medium border border-blue-600/30"
+            >
+              CTO Dashboard
+            </a>
             <span className="text-gray-400 text-sm">{userName}</span>
             <button
               onClick={logout}

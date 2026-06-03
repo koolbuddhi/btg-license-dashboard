@@ -1,7 +1,8 @@
-import { LicenseTier, classifyLicenseTier } from './license-tiers';
+import { LicenseTier } from './license-tiers';
+import { analyzeUserLicenses, LicenseAnalysis, BUNDLE_INFO, BundleTier } from './license-sku-map';
 
 export type UserType = 'real-user' | 'mailbox-only' | 'service-account' | 'guest' | 'shared' | 'unknown';
-export type ActionFlag = 'dormant' | 'over-licensed' | 'under-licensed' | 'missing-department' | 'missing-title' | 'no-license';
+export type ActionFlag = 'dormant' | 'over-licensed' | 'under-licensed' | 'missing-department' | 'missing-title' | 'no-license' | 'redundant-sku';
 
 export interface UserContext {
   userId: string;
@@ -9,7 +10,7 @@ export interface UserContext {
   userPrincipalName: string;
   department?: string;
   jobTitle?: string;
-  userTypeFromGraph?: string; // 'Member' | 'Guest'
+  userTypeFromGraph?: string;
   assignedLicenseSkus: string[];
   licenseSkuNames: string[];
   lastSignInDateTime?: string;
@@ -25,6 +26,7 @@ export interface UserClassification {
   reasonSummary: string;
   isDormant: boolean;
   monthlyCostEstimate: number;
+  licenseAnalysis: LicenseAnalysis;
 }
 
 const DORMANT_DAYS = 30;
@@ -58,7 +60,7 @@ function detectShared(upn: string, dept?: string, title?: string): boolean {
   );
 }
 
-export function classifyUser(user: UserContext, licenseTiersBySkuId: Record<string, LicenseTier>): UserClassification {
+export function classifyUser(user: UserContext): UserClassification {
   const actionFlags: ActionFlag[] = [];
   const reasonParts: string[] = [];
 
@@ -72,32 +74,20 @@ export function classifyUser(user: UserContext, licenseTiersBySkuId: Record<stri
     reasonParts.push('Shared mailbox/resource');
   } else if (detectServiceAccount(user.userPrincipalName, user.department, user.jobTitle)) {
     type = 'service-account';
-    reasonParts.push('Service account (by UPN/department/title)');
+    reasonParts.push('Service account');
   }
 
-  // 2. Analyze license tiers
-  const hasTiers: LicenseTier[] = user.assignedLicenseSkus
-    .map((skuId) => licenseTiersBySkuId[skuId])
-    .filter((t): t is LicenseTier => Boolean(t));
+  // 2. Run license analysis (uses SKU GUIDs to detect bundle + redundancy)
+  const licenseAnalysis = analyzeUserLicenses(user.assignedLicenseSkus);
+  const hasBundle = licenseAnalysis.effectiveBundle !== 'unknown-bundle';
+  const hasAddOns = licenseAnalysis.addOnSkus.length > 0;
+  const hasRedundant = licenseAnalysis.redundantSkus.length > 0;
 
-  const hasPremium = hasTiers.includes('premium');
-  const hasBasic = hasTiers.includes('basic');
-  const hasMailbox = hasTiers.includes('mailbox');
-  const hasTeams = hasTiers.includes('teams');
-  const hasUtility = hasTiers.includes('utility');
-
-  let primaryTier: LicenseTier = 'unknown';
-  if (hasPremium) primaryTier = 'premium';
-  else if (hasTeams) primaryTier = 'teams';
-  else if (hasBasic) primaryTier = 'basic';
-  else if (hasMailbox) primaryTier = 'mailbox';
-  else if (hasUtility) primaryTier = 'utility';
-
-  // 3. Mailbox-only detection (only mailbox/utility tiers, no real user tier)
+  // 3. Determine user type based on licenses
   if (type !== 'guest' && type !== 'shared' && type !== 'service-account') {
-    if (hasMailbox && !hasPremium && !hasBasic && !hasTeams) {
+    if (!hasBundle && hasAddOns) {
       type = 'mailbox-only';
-      reasonParts.push('Only mailbox/Exchange license');
+      reasonParts.push('Only component SKUs (no main bundle)');
     } else if (user.assignedLicenseSkus.length === 0) {
       type = 'real-user';
       actionFlags.push('no-license');
@@ -107,16 +97,32 @@ export function classifyUser(user: UserContext, licenseTiersBySkuId: Record<stri
     }
   }
 
-  // 4. Detect over-licensing (premium with low usage indicators)
-  if (type === 'real-user' && hasPremium) {
-    const utilityCount = hasTiers.filter((t) => t === 'utility').length;
-    if (utilityCount >= 3) {
-      actionFlags.push('over-licensed');
-      reasonParts.push(`Premium + ${utilityCount} utility add-ons`);
-    }
+  // 4. Map bundle to tier (for the column display)
+  const bundleToTier: Record<BundleTier, LicenseTier> = {
+    'e5': 'premium',
+    'e3': 'premium',
+    'e1': 'basic',
+    'f3': 'basic',
+    'f1': 'mailbox',
+    'business-premium': 'premium',
+    'business-standard': 'basic',
+    'business-basic': 'basic',
+    'ems-e5': 'utility',
+    'ems-e3': 'utility',
+    'unknown-bundle': 'unknown',
+  };
+  const primaryTier = bundleToTier[licenseAnalysis.effectiveBundle];
+
+  // 5. Detect over-licensing (bundle + redundant SKUs already in the bundle)
+  if (type === 'real-user' && hasRedundant) {
+    actionFlags.push('redundant-sku');
+    actionFlags.push('over-licensed');
+    reasonParts.push(
+      `${licenseAnalysis.bundleLabel} already includes: ${licenseAnalysis.redundantSkus.length} redundant SKU(s) ($${licenseAnalysis.redundantMonthlyCost.toFixed(0)}/mo wasted)`
+    );
   }
 
-  // 5. Missing data flags (CTO can demand IT to fix)
+  // 6. Missing data flags
   if (!user.department || user.department.trim() === '') {
     actionFlags.push('missing-department');
     reasonParts.push('Missing department');
@@ -129,39 +135,29 @@ export function classifyUser(user: UserContext, licenseTiersBySkuId: Record<stri
     reasonParts.push('No usage location set');
   }
 
-  // 6. Dormancy check (both criteria)
+  // 7. Dormancy check
   const isDormant = checkDormant(user.lastSignInDateTime, user.assignedLicenseSkus.length, type);
   if (isDormant) {
     actionFlags.push('dormant');
     reasonParts.push('Dormant: no sign-in >30d or unused');
   }
 
-  // 7. Cost estimate
-  const costMap: Record<LicenseTier, number> = {
-    premium: 57,
-    basic: 12.5,
-    teams: 15,
-    mailbox: 4,
-    utility: 8,
-    unknown: 0,
-  };
-  const monthlyCostEstimate = hasTiers.reduce((sum, t) => sum + costMap[t], 0);
-
   return {
     type,
     primaryTier,
-    hasTiers: Array.from(new Set(hasTiers)),
+    hasTiers: [primaryTier, ...licenseAnalysis.addOnSkus.map(() => 'utility' as LicenseTier)].filter((t, i, a) => a.indexOf(t) === i),
     actionFlags,
     reasonSummary: reasonParts.join(' • '),
     isDormant,
-    monthlyCostEstimate,
+    monthlyCostEstimate: licenseAnalysis.totalMonthlyCost,
+    licenseAnalysis,
   };
 }
 
 function checkDormant(lastSignInDateTime: string | undefined, licenseCount: number, type: UserType): boolean {
   if (type === 'guest' || type === 'service-account' || type === 'shared') return false;
   if (licenseCount === 0) return true;
-  if (!lastSignInDateTime) return true; // No sign-in record at all
+  if (!lastSignInDateTime) return true;
   const lastSignIn = new Date(lastSignInDateTime);
   const now = new Date();
   const daysSince = (now.getTime() - lastSignIn.getTime()) / (1000 * 60 * 60 * 24);
@@ -172,63 +168,113 @@ export interface DepartmentMetrics {
   department: string;
   headcount: number;
   byType: Record<UserType, number>;
-  byTier: Record<LicenseTier, number>;
-  actionFlagCounts: Record<ActionFlag, number>;
-  totalMonthlyCostEstimate: number;
-  utilizationRate: number; // % of users with sign-in in last 30 days
-  costOptimalScore: number; // 0-100 score
+  byBundle: Record<BundleTier, number>;
+  redundantSkuCount: number;
+  redundantMonthlyCost: number;
+  dormantCount: number;
+  missingDataCount: number;
+  totalMonthlyCost: number;
+  utilizationRate: number;
+  costOptimalScore: number;
+  users: ClassifiedUserForDrill[]; // for drill-down
+}
+
+export interface ClassifiedUserForDrill {
+  userId: string;
+  displayName: string;
+  userPrincipalName: string;
+  department: string;
+  jobTitle?: string;
+  type: UserType;
+  bundleLabel: string;
+  primaryTier: LicenseTier;
+  actionFlags: ActionFlag[];
+  reasonSummary: string;
+  isDormant: boolean;
+  monthlyCost: number;
+  lastSignInDateTime?: string;
+  skuIds: string[];
 }
 
 export function aggregateByDepartment(
   users: { classification: UserClassification; user: UserContext }[]
 ): DepartmentMetrics[] {
-  const byDept = new Map<string, { users: { classification: UserClassification; user: UserContext }[] }>();
+  const byDept = new Map<string, { entries: { classification: UserClassification; user: UserContext }[] }>();
 
   for (const item of users) {
     const dept = item.user.department?.trim() || '⚠ Unassigned';
-    if (!byDept.has(dept)) byDept.set(dept, { users: [] });
-    byDept.get(dept)!.users.push(item);
+    if (!byDept.has(dept)) byDept.set(dept, { entries: [] });
+    byDept.get(dept)!.entries.push(item);
   }
 
   const results: DepartmentMetrics[] = [];
-  for (const [dept, { users }] of byDept) {
+  for (const [dept, { entries }] of byDept) {
     const byType: Record<UserType, number> = {
-      'real-user': 0, 'mailbox-only': 0, 'service-account': 0, 'guest': 0, 'shared': 0, 'unknown': 0,
+      'real-user': 0, 'mailbox-only': 0, 'service-account': 0, guest: 0, shared: 0, unknown: 0,
     };
-    const byTier: Record<LicenseTier, number> = {
-      premium: 0, basic: 0, teams: 0, mailbox: 0, utility: 0, unknown: 0,
-    };
-    const actionFlagCounts: Record<ActionFlag, number> = {
-      dormant: 0, 'over-licensed': 0, 'under-licensed': 0, 'missing-department': 0, 'missing-title': 0, 'no-license': 0,
+    const byBundle: Record<BundleTier, number> = {
+      'e5': 0, 'e3': 0, 'e1': 0, 'f3': 0, 'f1': 0,
+      'business-premium': 0, 'business-standard': 0, 'business-basic': 0,
+      'ems-e5': 0, 'ems-e3': 0, 'unknown-bundle': 0,
     };
     let totalCost = 0;
     let activeUsers = 0;
+    let redundantSkuCount = 0;
+    let redundantMonthlyCost = 0;
+    let dormantCount = 0;
+    let missingDataCount = 0;
+    const drillUsers: ClassifiedUserForDrill[] = [];
 
-    for (const { classification, user } of users) {
+    for (const { classification, user } of entries) {
       byType[classification.type]++;
-      byTier[classification.primaryTier]++;
+      byBundle[classification.licenseAnalysis.effectiveBundle]++;
       totalCost += classification.monthlyCostEstimate;
-      for (const flag of classification.actionFlags) {
-        actionFlagCounts[flag]++;
+      redundantSkuCount += classification.licenseAnalysis.redundantSkus.length;
+      redundantMonthlyCost += classification.licenseAnalysis.redundantMonthlyCost;
+      if (classification.actionFlags.includes('dormant')) dormantCount++;
+      if (classification.actionFlags.includes('missing-department') ||
+          classification.actionFlags.includes('missing-title')) {
+        missingDataCount++;
       }
       if (!classification.isDormant && user.assignedLicenseSkus.length > 0) activeUsers++;
+
+      drillUsers.push({
+        userId: user.userId,
+        displayName: user.displayName,
+        userPrincipalName: user.userPrincipalName,
+        department: dept,
+        jobTitle: user.jobTitle,
+        type: classification.type,
+        bundleLabel: classification.licenseAnalysis.bundleLabel,
+        primaryTier: classification.primaryTier,
+        actionFlags: classification.actionFlags,
+        reasonSummary: classification.reasonSummary,
+        isDormant: classification.isDormant,
+        monthlyCost: classification.monthlyCostEstimate,
+        lastSignInDateTime: user.lastSignInDateTime,
+        skuIds: user.assignedLicenseSkus,
+      });
     }
 
-    const utilizationRate = users.length > 0 ? activeUsers / users.length : 0;
-    const issues = actionFlagCounts['over-licensed'] + actionFlagCounts['missing-department'] + actionFlagCounts['missing-title'];
-    const costOptimalScore = Math.max(0, 100 - issues * 10 - (1 - utilizationRate) * 50);
+    const utilizationRate = entries.length > 0 ? activeUsers / entries.length : 0;
+    const issues = (redundantSkuCount > 0 ? 1 : 0) + missingDataCount + dormantCount;
+    const costOptimalScore = Math.max(0, 100 - issues * 5 - (1 - utilizationRate) * 30 - (redundantMonthlyCost / Math.max(totalCost, 1)) * 20);
 
     results.push({
       department: dept,
-      headcount: users.length,
+      headcount: entries.length,
       byType,
-      byTier,
-      actionFlagCounts,
-      totalMonthlyCostEstimate: totalCost,
+      byBundle,
+      redundantSkuCount,
+      redundantMonthlyCost,
+      dormantCount,
+      missingDataCount,
+      totalMonthlyCost: Math.round(totalCost),
       utilizationRate,
       costOptimalScore: Math.round(costOptimalScore),
+      users: drillUsers,
     });
   }
 
-  return results.sort((a, b) => b.totalMonthlyCostEstimate - a.totalMonthlyCostEstimate);
+  return results.sort((a, b) => b.totalMonthlyCost - a.totalMonthlyCost);
 }
