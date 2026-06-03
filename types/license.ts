@@ -50,8 +50,13 @@ export interface UserLicenseAssignment {
   displayName: string;
   userPrincipalName: string;
   department?: string;
+  jobTitle?: string;
+  usageLocation?: string;
+  userTypeFromGraph?: string;
+  accountEnabled?: boolean;
   assignedLicenses: string[];
   licenseDetails: LicenseAssignmentDetail[];
+  lastSignInDateTime?: string;
 }
 
 export interface LicenseOverview {

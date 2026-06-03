@@ -94,7 +94,7 @@ export async function fetchUserAssignments(
   top: number = 999
 ): Promise<UserLicenseAssignment[]> {
   const response = await fetch(
-    `https://graph.microsoft.com/v1.0/users?$top=${top}&$select=id,displayName,userPrincipalName,department,assignedLicenses`,
+    `https://graph.microsoft.com/v1.0/users?$top=${top}&$select=id,displayName,userPrincipalName,department,jobTitle,usageLocation,userType,accountEnabled,assignedLicenses`,
     {
       headers: { Authorization: `Bearer ${token}` },
     }
@@ -106,8 +106,40 @@ export async function fetchUserAssignments(
     displayName: user.displayName,
     userPrincipalName: user.userPrincipalName,
     department: user.department || undefined,
+    jobTitle: user.jobTitle || undefined,
+    usageLocation: user.usageLocation || undefined,
+    userTypeFromGraph: user.userType || undefined,
+    accountEnabled: user.accountEnabled !== false,
     assignedLicenses: (user.assignedLicenses || []).map((l: any) => l.skuId),
     licenseDetails: [],
+  }));
+}
+
+export interface SignInActivity {
+  userId: string;
+  userPrincipalName: string;
+  lastSignInDateTime?: string;
+}
+
+export async function fetchUserSignInActivity(
+  token: string,
+  top: number = 999
+): Promise<SignInActivity[]> {
+  const response = await fetch(
+    `https://graph.microsoft.com/beta/users?$top=${top}&$select=id,userPrincipalName,signInActivity`,
+    {
+      headers: { Authorization: `Bearer ${token}` },
+    }
+  );
+  if (!response.ok) {
+    console.warn('signInActivity not available (requires beta or audit log access)');
+    return [];
+  }
+  const data = await response.json();
+  return data.value.map((user: any) => ({
+    userId: user.id,
+    userPrincipalName: user.userPrincipalName,
+    lastSignInDateTime: user.signInActivity?.lastSignInDateTime,
   }));
 }
 
